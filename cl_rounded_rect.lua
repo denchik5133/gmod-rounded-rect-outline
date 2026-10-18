@@ -1,8 +1,8 @@
 /***
  *   @addon         DrawOutlinedRoundedRect
- *   @component     UI Effects
+ *   @component     UI Rendering
  *   @license       MIT License
- *   @version       1.0.0
+ *   @version       2.0.0
  *   @release_date  13/07/2026
  *   @author        DDI Scripts
  *
@@ -10,76 +10,40 @@
  *                  Discord:  https://discord.gg/CND6B5sH3j
  *                  GitHub:   https://github.com/denchik5133/gmod-rounded-rect-outline
  *
- *   @description   Draws rectangle outlines with rounded corners on the
- *                  client 2D surface, with adjustable stroke thickness.
- *                  Corners are rendered using the stock engine textures
- *                  (gui/corner8/16/32/64/512, the same ones stock draw.lua
- *                  uses for draw.RoundedBox) instead of hand-built vector
- *                  polygons, so the OUTER edge is smooth at any radius with
- *                  no pixelated/jagged ('staircase') look. The INNER edge
- *                  (where the stroke meets the hollow middle) is cut with a
- *                  stencil test and then softened with a short alpha
- *                  feather, since a stencil test itself has no
- *                  antialiasing -- see @notes for why, and why a fully
- *                  baked-texture approach was tried and reverted.
+ *   @description   Draws rounded rectangle outlines on the client 2D
+ *                  surface with antialiased outer and inner edges. The
+ *                  outline is rendered as a triangle mesh with per-vertex
+ *                  alpha ramps; no stencil cut is used.
  *
  *   @functions
  *                  - DrawOutlinedRoundedRect: Draws a rounded rectangle
  *                    outline with configurable radius, thickness, and color.
- *                  - _GetCornerTexture (internal): Picks the smallest stock
- *                    corner texture that is >= the requested radius.
+ *                  - _GetUnitArc (internal): Returns cached unit-circle
+ *                    points for a quarter arc at the requested detail.
+ *                  - _NormalizeRectArguments (internal): Rounds and clamps
+ *                    rectangle dimensions and outline parameters.
  *
  *   @example
  *                  hook.Add('HUDPaint', 'MyRoundedRect', function()
  *                      surface.DrawOutlinedRoundedRect(100, 100, 200, 100, 16, 2, color_white)
  *                  end)
  *
- *   @notes         How the outline is built:
- *                  1. Draw an inner rounded box (radius - thickness),
- *                     inset by `thickness` on every side, writing only to
- *                     the stencil buffer. Colour writes are force-disabled
- *                     for this pass via render.OverrideColorWriteEnable(
- *                     true, false) -- relying on draw color alpha = 0
- *                     instead is NOT reliable, GMod's blend state can leave
- *                     a pixel's colour untouched without that implying the
- *                     stencil write was skipped too (or vice versa).
- * 
- *                     This pass marks the hole with an explicit
- *                     triangle-fan arc (not the stock corner texture) --
- *                     a textured quad rasterizes, and therefore
- *                     stencil-marks, its ENTIRE r x r square regardless of
- *                     the texture's per-pixel alpha, which would wrongly
- *                     mark part of the visible ring (the texture's
- *                     transparent 'cut corner' triangle) as hole too,
- *                     eating a chunk out of the ring near each corner.
- *                  2. Draw the full-size outer rounded box normally
- *                     (stock corner textures, smooth), with the stencil
- *                     compare function set to only pass pixels that were
- *                     NOT marked in step 1.
- *                  A stencil test is always a hard pass/fail, never
- *                  antialiased, no matter how precise the shape tested
- *                  against is -- so the inner edge stays jagged even
- *                  though the outer edge (drawn from a real texture) is
- *                  smooth. Two attempts to fix that were tried and
- *                  reverted, see @notes below.
+ *   @notes         The outline is built from three radial bands for each
+ *                  rounded corner (outer fade, solid stroke, inner fade)
+ *                  and matching horizontal/vertical bands for the straight
+ *                  edges. The alpha transition is interpolated across mesh
+ *                  triangles, smoothing both contours without the hard
+ *                  pass/fail edge of a stencil test.
  *
- *                  Two other approaches were tried for the inner edge and
- *                  reverted because they made things worse, not better:
+ *                  Quarter-circle coordinates are cached by segment count
+ *                  (32-96 segments) and reused across draw calls. A single
+ *                  material is created when this file loads; no render
+ *                  targets or stencil buffer are used.
  *
- *                  - Baking the whole ring into a supersampled RenderTarget
- *                    texture (antialiasing both edges from one alpha
- *                    channel). GMod RT alpha-channel behaviour proved too
- *                    fragile to get right reliably -- it kept producing an
- *                    opaque black square instead of a transparent one, for
- *                    more than one distinct underlying cause.
- *                  - Feathering the inner edge with extra low-alpha bands
- *                    drawn just inside the true radius. This visibly
- *                    thickened and blurred every stroke instead of
- *                    smoothing it, so it was removed again.
- *
- *                  Current state: outer edge smooth (texture-based), inner
- *                  edge is a plain hard stencil cut (visible pixelation at
- *                  small radii). See README.md for the full history.
+ *                  The antialiasing ramp can extend the visible outline by
+ *                  up to 0.5 pixels beyond the supplied rectangle. When
+ *                  radius is 0, a simple rectangular outline fast path is
+ *                  used instead of a mesh.
  */
 
 
@@ -90,182 +54,193 @@ local _rad = math.rad
 local _min = math.min
 local _max = math.max
 local _floor = math.floor
+local _ceil = math.ceil
 local _Round = math.Round
-local _ipairs = ipairs
-local _DrawPoly = surface.DrawPoly
-local _DrawRect = surface.DrawRect
-local _SetTexture = surface.SetTexture
-local _ClearStencil = render.ClearStencil
+
+local _MeshBegin = mesh.Begin
+local _MeshEnd = mesh.End
+local _MeshPosition = mesh.Position
+local _MeshColor = mesh.Color
+local _MeshAdvanceVertex = mesh.AdvanceVertex
+local _RenderSetMaterial = render.SetMaterial
 local _SetDrawColor = surface.SetDrawColor
-local _GetTextureID = surface.GetTextureID
-local _SetStencilEnable = render.SetStencilEnable
-local _SetStencilWriteMask = render.SetStencilWriteMask
-local _DrawTexturedRectUV = surface.DrawTexturedRectUV
-local _SetStencilTestMask = render.SetStencilTestMask
-local _SetStencilReferenceValue = render.SetStencilReferenceValue
-local _SetStencilCompareFunction = render.SetStencilCompareFunction
-local _SetStencilPassOperation = render.SetStencilPassOperation
-local _SetStencilFailOperation = render.SetStencilFailOperation
-local _SetStencilZFailOperation = render.SetStencilZFailOperation
-local _OverrideColorWriteEnable = render.OverrideColorWriteEnable
+local _DrawRect = surface.DrawRect
 
-local CORNER_TEXTURES = {
-    { size = 8, id = _GetTextureID('gui/corner8') },
-    { size = 16, id = _GetTextureID('gui/corner16') },
-    { size = 32, id = _GetTextureID('gui/corner32') },
-    { size = 64, id = _GetTextureID('gui/corner64') },
-    { size = 512, id = _GetTextureID('gui/corner512') },
-}
+local MIN_SEGMENTS = 32
+local MAX_SEGMENTS = 96
+local ARC_CACHE = { }
 
---- Picks the smallest stock corner texture whose native size is >= the
--- requested radius (falls back to the largest one available). Mirrors
--- the same selection stock draw.RoundedBoxEx uses.
-local function _GetCornerTexture(radius)
-    for _, entry in _ipairs(CORNER_TEXTURES) do
-        if (radius <= entry.size) then
-            return entry.id
-        end
+local function _GetUnitArc(segments)
+    local arc = ARC_CACHE[segments]
+    if (arc) then
+        return arc
     end
 
-    return CORNER_TEXTURES[#CORNER_TEXTURES].id
+    arc = { }
+    local angleStep = math.pi * 0.5 / segments
+
+    for i = 0, segments do
+        local angle = i * angleStep
+        arc[i + 1] = {
+            x = _cos(angle),
+            y = _sin(angle)
+        }
+    end
+
+    ARC_CACHE[segments] = arc
+    return arc
 end
 
---- Draws a filled rounded rectangle (all 4 corners rounded), same
--- behaviour as stock draw.RoundedBox but taking a raw Color instead of
--- going through draw.SetDrawColor state, so it composes cleanly with the
--- stencil-based outline logic below.
-local function _DrawFilledRoundedRect(x, y, w, h, radius, color)
+local function _NormalizeRectArguments(x, y, w, h, radius, thickness, color)
+    x = _Round(x)
+    y = _Round(y)
+    w = _max(_Round(w), 0)
+    h = _max(_Round(h), 0)
+    radius = _min(_max(_Round(radius or 0), 0), _floor(w * 0.5), _floor(h * 0.5))
+    thickness = _min(_max(_Round(thickness or 1), 0), radius > 0 and radius or _floor(_min(w, h) * 0.5))
+    return x, y, w, h, radius, thickness, color or color_white
+end
+
+local function _DrawPlainOutline(x, y, w, h, thickness, color)
+    if (thickness <= 0 or w <= 0 or h <= 0) then
+        return
+    end
+
     _SetDrawColor(color)
+    _DrawRect(x, y, w, thickness)
+    _DrawRect(x, y + h - thickness, w, thickness)
 
-    if (radius <= 0) then
-        _DrawRect(x, y, w, h)
-        return
+    local sideHeight = h - thickness * 2
+    if (sideHeight > 0) then
+        _DrawRect(x, y + thickness, thickness, sideHeight)
+        _DrawRect(x + w - thickness, y + thickness, thickness, sideHeight)
     end
-
-    -- Straight middle/edges, no texture needed.
-    _DrawRect(x + radius, y, w - radius * 2, h)
-    _DrawRect(x, y + radius, radius, h - radius * 2)
-    _DrawRect(x + w - radius, y + radius, radius, h - radius * 2)
-
-    -- Rounded corners via stock engine textures (see file header for why
-    -- these don't pixelate).
-    _SetTexture(_GetCornerTexture(radius))
-    _DrawTexturedRectUV(x, y, radius, radius, 0, 0, 1, 1) -- top-left
-    _DrawTexturedRectUV(x + w - radius, y, radius, radius, 1, 0, 0, 1) -- top-right
-    _DrawTexturedRectUV(x, y + h - radius, radius, radius, 0, 1, 1, 0) -- bottom-left
-    _DrawTexturedRectUV(x + w - radius, y + h - radius, radius, radius, 1, 1, 0, 0) -- bottom-right
 end
 
-local MASK_SEGMENTS = 32
+local OUTLINE_MATERIAL = CreateMaterial('DanLib_RoundedRectAA_VertexAlpha', 'UnlitGeneric', {
+    ['$basetexture'] = 'color/white',
+    ['$translucent'] = '1',
+    ['$vertexalpha'] = '1',
+    ['$vertexcolor'] = '1',
+    ['$nocull'] = '1'
+})
 
---- Draws one filled quarter-disc (a triangle fan from the center point),
--- used only for stencil-marking the inner hole -- see
--- _MarkStencilHole below for why this can't reuse the corner textures.
-local function _DrawFilledQuarterDisc(cx, cy, r, startAngleDeg)
-    if (r <= 0) then
-        return
-    end
-
-    local points = {
-        {
-            x = cx,
-            y = cy
-        }
-    }
-
-    for i = 0, MASK_SEGMENTS do
-        local a = _rad(startAngleDeg + (i / MASK_SEGMENTS) * 90)
-        points[#points + 1] = {
-            x = cx + _cos(a) * r,
-            y = cy + _sin(a) * r
-        }
-    end
-
-    _DrawPoly(points)
+-- All mesh vertices use alpha 0 or 1; raster interpolation creates the edge
+-- fade, so no per-vertex alpha multiplication or rounding is necessary.
+local function _EmitVertex(x, y, color, alpha)
+    _MeshPosition(x, y, 0)
+    _MeshColor(color.r, color.g, color.b, alpha == 0 and 0 or (color.a or 255))
+    _MeshAdvanceVertex()
 end
 
---- Marks the stencil buffer for a rounded rectangle's exact shape, to be
--- used as the 'hole' in DrawOutlinedRoundedRect. See file header notes
--- for why this uses an explicit triangle fan instead of the corner textures.
-local function _MarkStencilHole(x, y, w, h, radius)
-    if (radius <= 0) then
-        _DrawRect(x, y, w, h)
-        return
+local function _EmitQuad(x1, y1, a1, x2, y2, a2, x3, y3, a3, x4, y4, a4, color)
+    _EmitVertex(x1, y1, color, a1)
+    _EmitVertex(x2, y2, color, a2)
+    _EmitVertex(x3, y3, color, a3)
+
+    _EmitVertex(x1, y1, color, a1)
+    _EmitVertex(x3, y3, color, a3)
+    _EmitVertex(x4, y4, color, a4)
+end
+
+local function _EmitRoundedCorner(cx, cy, outerRadius, outerFullRadius, innerFullRadius, innerZeroRadius, startAngle, segments, color)
+    local arc = _GetUnitArc(segments)
+    local startRadians = _rad(startAngle)
+    local startCos = _cos(startRadians)
+    local startSin = _sin(startRadians)
+
+    for i = 1, segments do
+        local unit1 = arc[i]
+        local unit2 = arc[i + 1]
+        local cos1 = unit1.x * startCos - unit1.y * startSin
+        local sin1 = unit1.x * startSin + unit1.y * startCos
+        local cos2 = unit2.x * startCos - unit2.y * startSin
+        local sin2 = unit2.x * startSin + unit2.y * startCos
+
+        local outerX1 = cx + cos1 * outerRadius
+        local outerY1 = cy + sin1 * outerRadius
+        local outerX2 = cx + cos2 * outerRadius
+        local outerY2 = cy + sin2 * outerRadius
+        local outerFullX1 = cx + cos1 * outerFullRadius
+        local outerFullY1 = cy + sin1 * outerFullRadius
+        local outerFullX2 = cx + cos2 * outerFullRadius
+        local outerFullY2 = cy + sin2 * outerFullRadius
+        local innerFullX1 = cx + cos1 * innerFullRadius
+        local innerFullY1 = cy + sin1 * innerFullRadius
+        local innerFullX2 = cx + cos2 * innerFullRadius
+        local innerFullY2 = cy + sin2 * innerFullRadius
+        local innerZeroX1 = cx + cos1 * innerZeroRadius
+        local innerZeroY1 = cy + sin1 * innerZeroRadius
+        local innerZeroX2 = cx + cos2 * innerZeroRadius
+        local innerZeroY2 = cy + sin2 * innerZeroRadius
+
+        -- Fade the outside edge, draw the solid stroke body, then fade into
+        -- the transparent hole.
+        _EmitQuad(outerX1, outerY1, 0, outerX2, outerY2, 0, outerFullX2, outerFullY2, 1, outerFullX1, outerFullY1, 1, color)
+        _EmitQuad(outerFullX1, outerFullY1, 1, outerFullX2, outerFullY2, 1, innerFullX2, innerFullY2, 1, innerFullX1, innerFullY1, 1, color)
+        _EmitQuad(innerFullX1, innerFullY1, 1, innerFullX2, innerFullY2, 1, innerZeroX2, innerZeroY2, 0, innerZeroX1, innerZeroY1, 0, color)
     end
+end
 
-    _DrawRect(x + radius, y, w - radius * 2, h)
-    _DrawRect(x, y + radius, radius, h - radius * 2)
-    _DrawRect(x + w - radius, y + radius, radius, h - radius * 2)
+local function _EmitHorizontalBand(x1, x2, y1, alpha1, y2, alpha2, color)
+    _EmitQuad(x1, y1, alpha1, x2, y1, alpha1, x2, y2, alpha2, x1, y2, alpha2, color)
+end
 
-    _DrawFilledQuarterDisc(x + radius, y + radius, radius, 180) -- top-left
-    _DrawFilledQuarterDisc(x + w - radius, y + radius, radius, 270) -- top-right
-    _DrawFilledQuarterDisc(x + radius, y + h - radius, radius, 90) -- bottom-left
-    _DrawFilledQuarterDisc(x + w - radius, y + h - radius, radius, 0) -- bottom-right
+local function _EmitVerticalBand(y1, y2, x1, alpha1, x2, alpha2, color)
+    _EmitQuad(x1, y1, alpha1, x2, y1, alpha2, x2, y2, alpha2, x1, y2, alpha1, color)
 end
 
 --- surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
 --
--- Draws the outline of a rectangle with rounded corners, using stock
--- engine corner textures (no pixelation on the outer edge at any
--- radius) and the stencil buffer to punch out the inner area, leaving a
--- ring/outline. See the file header for the full explanation.
---
--- Parameters:
---     x, y - top-left corner coordinates
---     w, h - width and height of the rectangle
---     radius - corner radius
---     thickness - stroke thickness (default 1), clamped to <= radius
---     color - Color to draw with (default color_white)
+-- Draws a rounded rectangular outline with a soft alpha transition at both
+-- edges. Radius and thickness are rounded to whole pixels and clamped to
+-- the rectangle's size. Defaults: radius 0, thickness 1, color_white.
 function surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
-    x = _Round(x)
-    y = _Round(y)
-    w = _Round(w)
-    h = _Round(h)
-    radius = _min(_Round(radius or 0), _floor(w / 2), _floor(h / 2))
-    thickness = _min(_Round(thickness or 1), radius > 0 and radius or _floor(_min(w, h) / 2))
-    color = color or color_white
+    x, y, w, h, radius, thickness, color =
+        _NormalizeRectArguments(x, y, w, h, radius, thickness, color)
 
-    if (thickness <= 0) then
+    if (thickness <= 0 or w <= 0 or h <= 0) then
         return
     end
 
-    -- No corner rounding at all -- draw a plain rectangular outline, no
-    -- need for the stencil trick.
     if (radius <= 0) then
-        _SetDrawColor(color)
-        _DrawRect(x, y, w, thickness) -- top
-        _DrawRect(x, y + h - thickness, w, thickness) -- bottom
-        _DrawRect(x, y + thickness, thickness, h - thickness * 2) -- left
-        _DrawRect(x + w - thickness, y + thickness, thickness, h - thickness * 2) -- right
+        _DrawPlainOutline(x, y, w, h, thickness, color)
         return
     end
 
-    _ClearStencil()
-    _SetStencilEnable(true)
-    _SetStencilWriteMask(0xFF)
-    _SetStencilTestMask(0xFF)
-    _SetStencilReferenceValue(1)
-
-    -- Pass 1: mark the inner hole in the stencil buffer only.
-    _SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_ALWAYS)
-    _SetStencilPassOperation(STENCILOPERATION_REPLACE)
-    _SetStencilFailOperation(STENCILOPERATION_KEEP)
-    _SetStencilZFailOperation(STENCILOPERATION_KEEP)
-
+    local edgeFade = _min(0.5, thickness * 0.5)
     local innerRadius = _max(radius - thickness, 0)
+    local outerFullRadius = radius - edgeFade
+    local innerFullRadius = innerRadius + edgeFade
+    local innerZeroRadius = _max(innerRadius - edgeFade, 0)
+    local segments = _min(MAX_SEGMENTS, _max(MIN_SEGMENTS, _ceil(radius / 5)))
+    local triangleCount = segments * 24 + 24
 
-    _OverrideColorWriteEnable(true, false)
-    _SetDrawColor(color)
-    _MarkStencilHole(x + thickness, y + thickness, w - thickness * 2, h - thickness * 2, innerRadius)
-    _OverrideColorWriteEnable(false, false)
+    _RenderSetMaterial(OUTLINE_MATERIAL)
+    _MeshBegin(MATERIAL_TRIANGLES, triangleCount)
 
-    -- Pass 2: draw the outer rounded rect, but only where the stencil was
-    -- NOT marked in pass 1 -- i.e. skip the punched-out inner area,
-    -- leaving just the ring/outline visible.
-    _SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_NOTEQUAL)
-    _SetStencilPassOperation(STENCILOPERATION_KEEP)
+    -- Straight sections: each has an outside fade, a solid band, and an
+    -- inside fade. Rounded corners use the matching three radial bands.
+    _EmitHorizontalBand(x + radius, x + w - radius, y - edgeFade, 0, y + edgeFade, 1, color)
+    _EmitHorizontalBand(x + radius, x + w - radius, y + edgeFade, 1, y + thickness - edgeFade, 1, color)
+    _EmitHorizontalBand(x + radius, x + w - radius, y + thickness - edgeFade, 1, y + thickness + edgeFade, 0, color)
 
-    _DrawFilledRoundedRect(x, y, w, h, radius, color)
+    _EmitHorizontalBand(x + radius, x + w - radius, y + h - thickness - edgeFade, 0, y + h - thickness + edgeFade, 1, color)
+    _EmitHorizontalBand(x + radius, x + w - radius, y + h - thickness + edgeFade, 1, y + h - edgeFade, 1, color)
+    _EmitHorizontalBand(x + radius, x + w - radius, y + h - edgeFade, 1, y + h + edgeFade, 0, color)
 
-    _SetStencilEnable(false)
+    _EmitVerticalBand(y + radius, y + h - radius, x - edgeFade, 0, x + edgeFade, 1, color)
+    _EmitVerticalBand(y + radius, y + h - radius, x + edgeFade, 1, x + thickness - edgeFade, 1, color)
+    _EmitVerticalBand(y + radius, y + h - radius, x + thickness - edgeFade, 1, x + thickness + edgeFade, 0, color)
+
+    _EmitVerticalBand(y + radius, y + h - radius, x + w - thickness - edgeFade, 0, x + w - thickness + edgeFade, 1, color)
+    _EmitVerticalBand(y + radius, y + h - radius, x + w - thickness + edgeFade, 1, x + w - edgeFade, 1, color)
+    _EmitVerticalBand(y + radius, y + h - radius, x + w - edgeFade, 1, x + w + edgeFade, 0, color)
+
+    _EmitRoundedCorner(x + radius, y + radius, radius + edgeFade, outerFullRadius, innerFullRadius, innerZeroRadius, 180, segments, color)
+    _EmitRoundedCorner(x + w - radius, y + radius, radius + edgeFade, outerFullRadius, innerFullRadius, innerZeroRadius, 270, segments, color)
+    _EmitRoundedCorner(x + w - radius, y + h - radius, radius + edgeFade, outerFullRadius, innerFullRadius, innerZeroRadius, 0, segments, color)
+    _EmitRoundedCorner(x + radius, y + h - radius, radius + edgeFade, outerFullRadius, innerFullRadius, innerZeroRadius, 90, segments, color)
+
+    _MeshEnd()
 end
