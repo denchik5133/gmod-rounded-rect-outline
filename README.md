@@ -1,6 +1,6 @@
 # Rounded Rect Outline for Garry's Mod
 
-`surface.DrawOutlinedRoundedRect` draws rounded rectangle outlines in HUD and VGUI paint hooks. Both the outside and inside edges use a soft alpha transition, including the inner edge around the hollow center.
+`surface.DrawOutlinedRoundedRect` draws antialiased rounded rectangle outlines in screen-space rendering hooks. For VGUI panels, `Panel:DrawOutlinedRoundedRect` provides the same outline using panel-local coordinates. Both the outside and inside edges use a soft alpha transition, including the inner edge around the hollow center.
 
 The library is client-side, uses Garry's Mod's built-in Lua APIs, and has no external dependencies.
 
@@ -38,11 +38,11 @@ your_addon/
             └── cl_rounded_rect_demo.lua
 ```
 
-Restart or reload the addon on the client. The drawing function is added to the global `surface` table when the library file loads.
+Restart or reload the addon on the client. The library adds `surface.DrawOutlinedRoundedRect` and registers `Panel:DrawOutlinedRoundedRect` on the Panel metatable when the file loads.
 
 ## Quick start
 
-Call the function from a paint hook:
+For HUD hooks, pass screen-space coordinates:
 
 ```lua
 hook.Add('HUDPaint', 'MyRoundedOutline', function()
@@ -56,17 +56,18 @@ hook.Add('HUDPaint', 'MyRoundedOutline', function()
 end)
 ```
 
-`surface.DrawOutlinedRoundedRect` uses screen/UI pixel coordinates. Call it only while drawing, such as inside `HUDPaint`, `PostDrawHUD`, or a VGUI panel's `Paint` method.
+Use `surface.DrawOutlinedRoundedRect` in screen-space hooks such as `HUDPaint` or `PostDrawHUD`. In a VGUI panel's `Paint` method, use `self:DrawOutlinedRoundedRect` with panel-local coordinates instead; see the VGUI examples below.
 
 ## API
 
 ```lua
 surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
+panel:DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `x`, `y` | number | — | Top-left position |
+| `x`, `y` | number | — | Top-left position; screen coordinates for `surface.*`, panel-local coordinates for `Panel:*` |
 | `w`, `h` | number | — | Rectangle width and height |
 | `radius` | number | `0` | Corner radius, limited by half the shorter side |
 | `thickness` | number | `1` | Stroke width in pixels |
@@ -79,6 +80,7 @@ surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
 - Radius is clamped to `0..min(floor(w / 2), floor(h / 2))`.
 - With a positive radius, thickness is clamped to `0..radius`.
 - With radius `0`, the function draws a square-cornered rectangle and clamps thickness to half the shorter side.
+- A radius that clamps to `0` uses the square-cornered surface fast path; it does not use the rounded mesh.
 - A zero or negative thickness draws nothing.
 - The function does not return a value.
 
@@ -124,16 +126,44 @@ end)
 
 ### Draw from a VGUI panel
 
-Coordinates passed from `Paint(self, width, height)` are local to the panel:
+`Panel:Paint` coordinates are local to the panel. Use the Panel method so the mesh origin is converted to screen coordinates:
 
 ```lua
 local panel = vgui.Create('DPanel')
 panel:SetSize(280, 84)
 panel:SetPaintBackground(false)
 panel.Paint = function(self, width, height)
-    surface.DrawOutlinedRoundedRect(0, 0, width, height, 18, 2, Color(120, 190, 255))
+    self:DrawOutlinedRoundedRect(0, 0, width, height, 18, 2, Color(120, 190, 255))
 end
 ```
+
+The Panel method is registered by the library through `FindMetaTable('Panel')`. For rounded mesh draws, it converts only the outline's origin; width, height, radius, thickness, and mesh geometry remain unchanged. The radius-zero surface fast path keeps panel-local coordinates.
+
+### Inset outline inside a VGUI panel
+
+Panel-local offsets work the same way:
+
+```lua
+panel.Paint = function(self, width, height)
+    self:DrawOutlinedRoundedRect(8, 8, width - 16, height - 16, 14, 2, Color(120, 190, 255))
+end
+```
+
+### Square-corner outline in a VGUI panel
+
+The Panel method also handles the radius-zero fast path:
+
+```lua
+panel.Paint = function(self, width, height)
+    self:DrawOutlinedRoundedRect(0, 0, width, height, 0, 2, color_white)
+end
+```
+
+### VGUI coordinate and clipping note
+
+Do not pass panel-local `(0, 0)` to `surface.DrawOutlinedRoundedRect` when using the mesh path: direct `surface.*` calls use screen-space mesh coordinates, while VGUI's automatic origin offset applies to surface drawing operations. Use `self:DrawOutlinedRoundedRect(...)` in `Paint` for both rounded and square outlines. The Panel method handles the square fast path without applying the panel offset twice.
+
+The Panel method converts coordinates but does not create an additional clipping region. If the panel is inside a clipped or scrolling parent, verify the outline at the parent's edges. The antialiasing fringe can also extend up to `0.5` pixels beyond the rectangle; inset it slightly near clipping boundaries.
 
 ### Compare radius and thickness settings
 
@@ -168,7 +198,7 @@ end)
 
 ## How it works
 
-Rounded outlines are built as a triangle mesh. Each corner has three radial bands: an outer fade, a solid stroke, and an inner fade. Matching horizontal and vertical bands form the straight sections. Vertex alpha is interpolated across the triangles to soften both edges.
+Rounded outlines are built as a triangle mesh. Each corner has three radial bands: an outer fade, a solid stroke, and an inner fade. Matching horizontal and vertical bands form the straight sections. Vertex alpha is interpolated across the triangles to soften both edges. The panel method uses the same mesh; it only translates panel-local coordinates to screen coordinates.
 
 The library creates its material once when the file loads. It does not create render targets or read/write the stencil buffer. Unit points for quarter-circle arcs are cached by segment count and reused across draw calls. Corner detail is selected from 32 to 96 segments based on the radius.
 
@@ -188,7 +218,8 @@ The demo hook is removed when the command is run a second time. The demo file ca
 
 - Each rounded outline call generates one mesh. Avoid drawing outlines that are off-screen or hidden behind another panel.
 - The material and unit arc coordinates are cached; the mesh itself is generated for each call.
-- If nothing appears, confirm the library is installed in `lua/autorun/client`, the client has loaded it, and the call runs inside a paint hook.
+- If nothing appears, confirm the library is installed in `lua/autorun/client`, the client has loaded it, and the call runs inside a paint hook. In `Panel:Paint`, call `self:DrawOutlinedRoundedRect`; in screen-space hooks, call `surface.DrawOutlinedRoundedRect`.
+- If an outline is displaced in VGUI, check that panel-local coordinates are being passed to `self:DrawOutlinedRoundedRect`, not to the screen-space mesh call.
 - If the edge is clipped, inset the rectangle slightly to leave room for the half-pixel antialiasing fringe.
 - If an outline is unexpectedly rectangular, check that its radius is greater than zero and that its dimensions are large enough for the requested radius.
 - If there is no visible outline, check that thickness is greater than zero and that the color alpha is not zero.
