@@ -1,6 +1,6 @@
 # Rounded Rect Outline for Garry's Mod
 
-`surface.DrawOutlinedRoundedRect` draws antialiased rounded rectangle outlines in screen-space rendering hooks. For VGUI panels, `Panel:DrawOutlinedRoundedRect` provides the same outline using panel-local coordinates. Both the outside and inside edges use a soft alpha transition, including the inner edge around the hollow center.
+`surface.DrawOutlinedRoundedRect` draws rounded rectangle outlines in HUD paint hooks. For VGUI panels, call `self:DrawOutlinedRoundedRect` from `Paint` using panel-local coordinates. Both the outside and inside edges use a soft alpha transition, including the inner edge around the hollow center.
 
 The library is client-side, uses Garry's Mod's built-in Lua APIs, and has no external dependencies.
 
@@ -71,7 +71,7 @@ panel:DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
 | `w`, `h` | number | — | Rectangle width and height |
 | `radius` | number | `0` | Corner radius, limited by half the shorter side |
 | `thickness` | number | `1` | Stroke width in pixels |
-| `color` | Color | `color_white` | Stroke color; the color's alpha is preserved |
+| `color` | Color | `color_white` | Stroke color; `color.a` controls opacity. The Panel mesh path also multiplies it by the alpha of the panel and its ancestors. |
 
 ### Parameter rules
 
@@ -139,6 +139,35 @@ end
 
 The Panel method is registered by the library through `FindMetaTable('Panel')`. For rounded mesh draws, it converts only the outline's origin; width, height, radius, thickness, and mesh geometry remain unchanged. The radius-zero surface fast path keeps panel-local coordinates.
 
+### Fade an outline with its panel
+
+For a rounded mesh outline, `Panel:DrawOutlinedRoundedRect` combines the supplied color alpha with the alpha of the panel and its parent panels. This lets an outline drawn by a child panel fade along with a parent window that is animated with `AlphaTo`:
+
+```lua
+local popup = vgui.Create('DPanel')
+popup:SetSize(320, 180)
+popup:Center()
+
+local card = vgui.Create('DPanel', popup)
+card:SetSize(280, 120)
+card:Center()
+card:SetPaintBackground(false)
+card.Paint = function(self, width, height)
+    self:DrawOutlinedRoundedRect(0, 0, width, height, 18, 2, Color(120, 190, 255, 220))
+end
+
+-- Call this from your close handler:
+local function ClosePopup()
+    popup:AlphaTo(0, 0.1, 0, function()
+        if IsValid(popup) then
+            popup:Remove()
+        end
+    end)
+end
+```
+
+The outline fades during the same transition as the parent. The input `Color` is not modified. A rounded mesh drawn through `surface.DrawOutlinedRoundedRect` has no panel context, so pass the desired alpha in `color.a` yourself. The function draws only when called; a HUD hook must also stop drawing when its UI closes.
+
 ### Inset outline inside a VGUI panel
 
 Panel-local offsets work the same way:
@@ -196,11 +225,13 @@ hook.Add('HUDPaint', 'TranslucentOutline', function()
 end)
 ```
 
+For a rounded mesh drawn through `surface.DrawOutlinedRoundedRect`, the color alpha does not automatically follow a VGUI panel's `SetAlpha` or `AlphaTo` animation. Use `Panel:DrawOutlinedRoundedRect` inside `Paint` when the outline should inherit the panel and ancestor alpha. The radius-zero surface fast path uses regular surface rectangles instead.
+
 ## How it works
 
-Rounded outlines are built as a triangle mesh. Each corner has three radial bands: an outer fade, a solid stroke, and an inner fade. Matching horizontal and vertical bands form the straight sections. Vertex alpha is interpolated across the triangles to soften both edges. The panel method uses the same mesh; it only translates panel-local coordinates to screen coordinates.
+Rounded outlines are built as a triangle mesh. Each corner has three radial bands: an outer fade, a solid stroke, and an inner fade. Matching horizontal and vertical bands form the straight sections. Vertex alpha is interpolated across the triangles to soften both edges. The panel method uses the same mesh, translates panel-local coordinates to screen coordinates, and multiplies the outline alpha by the alpha of the panel and its ancestors. The rounded mesh path of the screen-space `surface` method has no panel context and uses the alpha supplied in `color`; the radius-zero fast path uses regular surface rectangles.
 
-The library creates its material once when the file loads. It does not create render targets or read/write the stencil buffer. Unit points for quarter-circle arcs are cached by segment count and reused across draw calls. Corner detail is selected from 32 to 96 segments based on the radius.
+The library creates its material once when the file loads. It does not create render targets or read/write the stencil buffer. Unit points for quarter-circle arcs are cached by segment count and reused across draw calls. Corner detail adapts from 8 to 96 segments based on the radius, targeting a maximum curve chord error of about 0.25 pixels.
 
 The radius controls the corner geometry; it does not change the requested rectangle's width or height. The edge fringe is intentionally soft and may reach half a pixel outside the given bounds.
 
@@ -216,10 +247,12 @@ The demo hook is removed when the command is run a second time. The demo file ca
 
 ## Performance and troubleshooting
 
-- Each rounded outline call generates one mesh. Avoid drawing outlines that are off-screen or hidden behind another panel.
-- The material and unit arc coordinates are cached; the mesh itself is generated for each call.
+- Each visible rounded outline call generates one mesh. The material and unit arc coordinates are cached; the mesh itself is generated for each call.
+- Rounded mesh calls with fully transparent colors or bounds fully outside the current viewport return before mesh generation. The square-corner fast path remains a small set of surface rectangles.
+- If many unchanged outlines are still expensive after profiling, a bounded `IMesh` cache per fixed UI element may avoid rebuilding the same geometry every frame; it is not enabled by default because changing size, radius, stroke, or color requires cache updates.
 - If nothing appears, confirm the library is installed in `lua/autorun/client`, the client has loaded it, and the call runs inside a paint hook. In `Panel:Paint`, call `self:DrawOutlinedRoundedRect`; in screen-space hooks, call `surface.DrawOutlinedRoundedRect`.
 - If an outline is displaced in VGUI, check that panel-local coordinates are being passed to `self:DrawOutlinedRoundedRect`, not to the screen-space mesh call.
+- If a rounded outline stays opaque while its parent fades with `AlphaTo`, use `self:DrawOutlinedRoundedRect` from `Paint`; a direct `surface.DrawOutlinedRoundedRect` call cannot infer the active panel's alpha.
 - If the edge is clipped, inset the rectangle slightly to leave room for the half-pixel antialiasing fringe.
 - If an outline is unexpectedly rectangular, check that its radius is greater than zero and that its dimensions are large enough for the requested radius.
 - If there is no visible outline, check that thickness is greater than zero and that the color alpha is not zero.
