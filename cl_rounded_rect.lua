@@ -2,7 +2,7 @@
  *   @addon         DrawOutlinedRoundedRect
  *   @component     UI Rendering
  *   @license       MIT License
- *   @version       2.2.1
+ *   @version       2.3.1
  *   @release_date  19/10/2026
  *   @author        DDI Scripts
  *
@@ -53,6 +53,9 @@
  *                  For rounded mesh draws, the Panel method multiplies the
  *                  supplied color alpha by this panel's and its ancestors'
  *                  alpha values, so parent fade animations affect the outline.
+ *                  Outlines inside DanLib scroll canvases are clipped to
+ *                  their scroll viewport without changing other panel
+ *                  drawing paths.
  *
  *                  Quarter-circle coordinates are cached by segment count
  *                  (8-96 segments) and selected to keep chord error near
@@ -61,10 +64,9 @@
  *                  file loads; no render targets or stencil buffer are used.
  *
  *                  The antialiasing ramp can extend up to 0.5 pixels beyond
- *                  the supplied rectangle. The Panel method translates
- *                  coordinates but does not create an additional clipping
- *                  region; check behavior inside clipped or scrolling
- *                  parents.
+ *                  the supplied rectangle. When the panel is inside a DanLib
+ *                  scroll canvas, the Panel method clips that mesh to the
+ *                  scroll viewport; direct surface calls are unchanged.
  */
 
 
@@ -90,6 +92,8 @@ local _RenderSetMaterial = render.SetMaterial
 local _SetDrawColor = surface.SetDrawColor
 local _DrawRect = surface.DrawRect
 local _IsValid = IsValid
+local _PushScissorRect = DanLib.pushScissorRect
+local _PopScissorRect = DanLib.popScissorRect
 
 local MIN_SEGMENTS = 8
 local MAX_SEGMENTS = 96
@@ -292,6 +296,49 @@ function surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
     _MeshEnd()
 end
 
+-- Find the visible viewport of any DanLib scroll panels containing this panel.
+-- The screen-space mesh bypasses VGUI's normal canvas clipping, so the Panel
+-- wrapper applies this intersection only around its rounded draw.
+local function _GetVirtualScrollClip(panel)
+    local clipLeft, clipTop, clipRight, clipBottom
+    local foundScroll = false
+    local child = panel
+    local parent = panel:GetParent()
+
+    while _IsValid(parent) do
+        if (parent.pnlCanvas == child and parent.VBar) then
+            local x, y = parent:LocalToScreen(0, 0)
+            local width, height = parent:GetSize()
+
+            if foundScroll then
+                clipLeft = _max(clipLeft, x)
+                clipTop = _max(clipTop, y)
+                clipRight = _min(clipRight, x + width)
+                clipBottom = _min(clipBottom, y + height)
+            else
+                clipLeft = x
+                clipTop = y
+                clipRight = x + width
+                clipBottom = y + height
+                foundScroll = true
+            end
+
+            if (clipRight <= clipLeft or clipBottom <= clipTop) then
+                return true, false
+            end
+        end
+
+        child = parent
+        parent = parent:GetParent()
+    end
+
+    if foundScroll then
+        return true, true, clipLeft, clipTop, clipRight, clipBottom
+    end
+
+    return false
+end
+
 
 -- VGUI panels use local coordinates in Paint. The rounded mesh needs
 -- screen-space coordinates, while the radius-zero surface path already gets
@@ -343,7 +390,19 @@ if PanelMeta then
             return
         end
 
+        local hasScrollClip, hasVisibleScrollClip, clipLeft, clipTop, clipRight, clipBottom = _GetVirtualScrollClip(self)
+        if (hasScrollClip and not hasVisibleScrollClip) then
+            return
+        end
+
         local screenX, screenY = self:LocalToScreen(x, y)
+        if (hasScrollClip and _PushScissorRect and _PopScissorRect) then
+            _PushScissorRect(clipLeft, clipTop, clipRight, clipBottom)
+            local result = surface.DrawOutlinedRoundedRect(screenX, screenY, w, h, radius, thickness, drawColor)
+            _PopScissorRect()
+            return result
+        end
+
         return surface.DrawOutlinedRoundedRect(screenX, screenY, w, h, radius, thickness, drawColor)
     end
 end
