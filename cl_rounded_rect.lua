@@ -2,7 +2,7 @@
  *   @addon         DrawOutlinedRoundedRect
  *   @component     UI Rendering
  *   @license       MIT License
- *   @version       2.3.1
+ *   @version       2.2.1
  *   @release_date  19/10/2026
  *   @author        DDI Scripts
  *
@@ -89,17 +89,18 @@ local _MeshPosition = mesh.Position
 local _MeshColor = mesh.Color
 local _MeshAdvanceVertex = mesh.AdvanceVertex
 local _RenderSetMaterial = render.SetMaterial
+local _SetScissorRect = render.SetScissorRect
 local _SetDrawColor = surface.SetDrawColor
 local _DrawRect = surface.DrawRect
 local _IsValid = IsValid
-local _PushScissorRect = DanLib.pushScissorRect
-local _PopScissorRect = DanLib.popScissorRect
 
 local MIN_SEGMENTS = 8
 local MAX_SEGMENTS = 96
 local MAX_CURVE_ERROR = 0.25
 local MAX_EDGE_FADE = 0.5
 local ARC_CACHE = { }
+local TAB = { }
+local LEN = 0
 
 local function _GetUnitArc(segments)
     local arc = ARC_CACHE[segments]
@@ -122,13 +123,42 @@ local function _GetUnitArc(segments)
     return arc
 end
 
+
+-- Additional stuff to scissor rect. needed for panels, i.e. multiple DScrollPanels clipping.
+local function _PushScissorRect(x, y, endX, endY)
+    local prev = TAB[LEN]
+    if prev then
+        x = _max(prev[1], x)
+        y = _max(prev[2], y)
+        endX = _min(prev[3], endX)
+        endY = _min(prev[4], endY)
+    end
+
+    LEN = LEN + 1
+    TAB[LEN] = { x, y, endX, endY }
+    _SetScissorRect(x, y, endX, endY, true)
+end
+
+-- Pops last scissor rect's boundaries from the stack. Simmilar to Pop ModelMatrix/RenderTarget/Filter(Mag/Min)
+local function _PopScissorRect()
+    TAB[LEN] = nil
+    LEN = _max(0, LEN - 1)
+
+    local newTab = TAB[LEN]
+    if newTab then
+        _SetScissorRect(newTab[1], newTab[2], newTab[3], newTab[4], true)
+    else
+        _SetScissorRect(0, 0, 0, 0, false)
+    end
+end
+
+
 -- Choose enough straight segments per quarter-circle to keep the maximum
 -- chord deviation below MAX_CURVE_ERROR pixels, within safe quality bounds.
 local function _GetSegmentCount(radius)
     local curveRadius = radius + MAX_EDGE_FADE
     local maxHalfStep = _acos(1 - MAX_CURVE_ERROR / curveRadius)
     local segments = _ceil((math.pi * 0.25) / maxHalfStep)
-
     return _min(MAX_SEGMENTS, _max(MIN_SEGMENTS, segments))
 end
 
