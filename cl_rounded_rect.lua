@@ -2,13 +2,13 @@
  *   @addon         DrawOutlinedRoundedRect
  *   @component     UI Rendering
  *   @license       MIT License
- *   @version       2.2.1
+ *   @version       2.2.2
  *   @release_date  19/10/2026
  *   @author        DDI Scripts
  *
  *   @contact
- *                  Discord:  https://discord.gg/CND6B5sH3j
- *                  GitHub:   https://github.com/denchik5133/gmod-rounded-rect-outline
+ *                  Discord: https://discord.gg/CND6B5sH3j
+ *                  GitHub: https://github.com/denchik5133/gmod-rounded-rect-outline
  *
  *   @description   Draws rounded rectangle outlines on the client 2D
  *                  surface with antialiased outer and inner edges. The
@@ -326,43 +326,37 @@ function surface.DrawOutlinedRoundedRect(x, y, w, h, radius, thickness, color)
     _MeshEnd()
 end
 
--- Find the visible viewport of any DanLib scroll panels containing this panel.
--- The screen-space mesh bypasses VGUI's normal canvas clipping, so the Panel
--- wrapper applies this intersection only around its rounded draw.
-local function _GetVirtualScrollClip(panel)
+-- Find the visible intersection of this panel's ancestors. The screen-space
+-- mesh bypasses VGUI's normal child clipping, so the Panel wrapper applies
+-- this intersection only around its rounded draw.
+local function _GetParentClip(panel)
     local clipLeft, clipTop, clipRight, clipBottom
-    local foundScroll = false
-    local child = panel
     local parent = panel:GetParent()
 
     while _IsValid(parent) do
-        if (parent.pnlCanvas == child and parent.VBar) then
-            local x, y = parent:LocalToScreen(0, 0)
-            local width, height = parent:GetSize()
+        local x, y = parent:LocalToScreen(0, 0)
+        local width, height = parent:GetSize()
 
-            if foundScroll then
-                clipLeft = _max(clipLeft, x)
-                clipTop = _max(clipTop, y)
-                clipRight = _min(clipRight, x + width)
-                clipBottom = _min(clipBottom, y + height)
-            else
-                clipLeft = x
-                clipTop = y
-                clipRight = x + width
-                clipBottom = y + height
-                foundScroll = true
-            end
-
-            if (clipRight <= clipLeft or clipBottom <= clipTop) then
-                return true, false
-            end
+        if clipLeft then
+            clipLeft = _max(clipLeft, x)
+            clipTop = _max(clipTop, y)
+            clipRight = _min(clipRight, x + width)
+            clipBottom = _min(clipBottom, y + height)
+        else
+            clipLeft = x
+            clipTop = y
+            clipRight = x + width
+            clipBottom = y + height
         end
 
-        child = parent
+        if (clipRight <= clipLeft or clipBottom <= clipTop) then
+            return true, false
+        end
+
         parent = parent:GetParent()
     end
 
-    if foundScroll then
+    if clipLeft then
         return true, true, clipLeft, clipTop, clipRight, clipBottom
     end
 
@@ -420,13 +414,13 @@ if PanelMeta then
             return
         end
 
-        local hasScrollClip, hasVisibleScrollClip, clipLeft, clipTop, clipRight, clipBottom = _GetVirtualScrollClip(self)
-        if (hasScrollClip and not hasVisibleScrollClip) then
+        local hasParentClip, hasVisibleParentClip, clipLeft, clipTop, clipRight, clipBottom = _GetParentClip(self)
+        if (hasParentClip and not hasVisibleParentClip) then
             return
         end
 
         local screenX, screenY = self:LocalToScreen(x, y)
-        if (hasScrollClip and _PushScissorRect and _PopScissorRect) then
+        if (hasParentClip) then
             _PushScissorRect(clipLeft, clipTop, clipRight, clipBottom)
             local result = surface.DrawOutlinedRoundedRect(screenX, screenY, w, h, radius, thickness, drawColor)
             _PopScissorRect()
